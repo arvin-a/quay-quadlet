@@ -1,0 +1,18 @@
+# FileName=quay-redis.container
+[Unit]
+Description=Redis cache for Quay container registry
+Wants=systemd-networkd.socket network.target
+
+[Container]
+ContainerName=quay-redis
+Image=docker.io/library/redis:7
+LogDriver=k8s-file
+PodmanArgs=--log-opt max-size=10m --log-opt max-files=3
+Network=host
+# No persistent volume needed - redis is used only for ephemeral session/build logs
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

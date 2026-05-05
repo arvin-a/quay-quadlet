@@ -1,0 +1,73 @@
+# Quay container registry configuration
+# Replace all CHANGE_ME_* values before deploying
+
+AUTHENTICATION_TYPE: Database
+
+# Random secret strings - generate with: openssl rand -hex 32
+DATABASE_SECRET_KEY: test
+SECRET_KEY: test
+
+# PostgreSQL connection string
+# Password must match POSTGRES_PASSWORD in quay-postgres.container
+DB_URI: postgresql://quay:test@127.0.0.1:5433/quay
+
+# Public-facing hostname (no scheme, no port)
+SERVER_HOSTNAME: quay.arvhomelab.com:8443
+PREFERRED_URL_SCHEME: https
+EXTERNAL_TLS_TERMINATION: false
+
+# Redis (buildlogs and user events)
+BUILDLOGS_REDIS:
+  host: 127.0.0.1
+  port: 6379
+
+USER_EVENTS_REDIS:
+  host: 127.0.0.1
+  port: 6379
+
+# Local filesystem storage
+DISTRIBUTED_STORAGE_CONFIG:
+  default:
+    - LocalStorage
+    - storage_path: /datastorage/registry
+
+DISTRIBUTED_STORAGE_DEFAULT_LOCATIONS:
+  - default
+
+DISTRIBUTED_STORAGE_PREFERENCE:
+  - default
+
+# Registry settings
+SETUP_COMPLETE: true
+REGISTRY_STATE: normal
+
+# Superusers (must be created via the Quay UI or API first)
+SUPER_USERS:
+  - admin
+
+# Tag expiration
+DEFAULT_TAG_EXPIRATION: 2w
+TAG_EXPIRATION_OPTIONS:
+  - 1d
+  - 1w
+  - 2w
+  - 4w
+
+# Feature flags
+FEATURE_UI_V2: true
+FEATURE_USER_CREATION: true
+FEATURE_DIRECT_LOGIN: true
+FEATURE_ANONYMOUS_ACCESS: false
+FEATURE_MAILING: false
+FEATURE_BUILD_SUPPORT: false
+FEATURE_SECURITY_SCANNER: false
+FEATURE_REPO_MIRROR: false
+FEATURE_APP_REGISTRY: false
+FEATURE_REQUIRE_ENCRYPTED_BASIC_AUTH: false
+FEATURE_REQUIRE_TEAM_INVITE: true
+FEATURE_CHANGE_TAG_EXPIRATION: true
+FEATURE_APP_SPECIFIC_TOKENS: true
+
+# Login timeout
+FRESH_LOGIN_TIMEOUT: 10m
+MAXIMUM_LAYER_SIZE: 20G

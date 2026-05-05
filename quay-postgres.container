@@ -1,0 +1,23 @@
+# FileName=quay-postgres.container
+[Unit]
+Description=PostgreSQL database for Quay container registry
+Wants=systemd-networkd.socket network.target
+
+[Container]
+ContainerName=quay-postgres
+Image=docker.io/library/postgres:15
+LogDriver=k8s-file
+PodmanArgs=--log-opt max-size=20m --log-opt max-files=3
+Network=host
+Volume=/home/arvin/app-data/quay/postgres:/var/lib/postgresql/data:Z
+Environment=POSTGRES_USER=quay
+Environment=POSTGRES_PASSWORD=test
+Environment=POSTGRES_DB=quay
+Environment=PGDATA=/var/lib/postgresql/data/pgdata
+Environment=PGPORT=5433
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

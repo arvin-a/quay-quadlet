@@ -1,0 +1,22 @@
+# FileName=quay.container
+[Unit]
+Description=Quay container registry
+Wants=systemd-networkd.socket network.target
+After=quay-postgres.service quay-redis.service
+Requires=quay-postgres.service quay-redis.service
+
+[Container]
+ContainerName=quay
+Image=quay.io/projectquay/quay:latest
+LogDriver=k8s-file
+PodmanArgs=--log-opt max-size=50m --log-opt max-files=3
+Network=host
+Environment=IGNORE_VALIDATION=true
+Volume=/home/arvin/app-data/quay/config:/conf/stack:Z
+Volume=/home/arvin/app-data/quay/storage:/datastorage:Z
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
