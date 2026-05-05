@@ -4,12 +4,12 @@
 # This script:
 # 1. Deploys quay-postgres, quay-redis, quay .container files to /etc/containers/systemd/
 # 2. Copies config.yaml to /home/arvin/app-data/quay/config
-# 3. Copies Let's Encrypt scripts and Cloudflare credentials
+# 3. Optionally installs user-provided TLS certificates
 # 4. Creates data, storage, postgres, and redis dirs
 # 5. Reloads systemd, starts the services in order, and tests them
 #
 # TLS is terminated directly by Quay (ssl.cert + ssl.key in config dir).
-# Run setup_letsencrypt.sh after first deploy to obtain and install certificates.
+# Pass --cert and --key to install your own certificates during deployment.
 
 set -euo pipefail
 
@@ -21,9 +21,6 @@ POSTGRES_CONTAINER_FILE="quay-postgres.container"
 REDIS_CONTAINER_FILE="quay-redis.container"
 QUAY_CONTAINER_FILE="quay.container"
 CONFIG_DIR="configs"
-LE_SETUP_SCRIPT="setup_letsencrypt.sh"
-LE_RENEWAL_SCRIPT="setup_renewal.sh"
-CF_INI_FILE="cloudflare.ini"
 
 # Local paths
 APP_DATA_DIR="/home/arvin/app-data/quay"
@@ -31,10 +28,19 @@ CONFIG_DEST_DIR="${APP_DATA_DIR}/config"
 STORAGE_DIR="${APP_DATA_DIR}/storage"
 POSTGRES_DIR="${APP_DATA_DIR}/postgres"
 
+# Certificate paths (optional, provided via --cert / --key)
+CERT_FILE=""
+KEY_FILE=""
+
 usage() {
-    echo "Usage: $0 [-h|--help]"
+    echo "Usage: $0 [-h|--help] [--cert <cert-file>] [--key <key-file>]"
     echo
     echo "Deploy Quay container registry with direct TLS (no HAProxy) on the local machine."
+    echo
+    echo "Options:"
+    echo "  --cert <file>   Path to the TLS certificate file (PEM) to install as ssl.cert"
+    echo "  --key  <file>   Path to the TLS private key file (PEM) to install as ssl.key"
+    echo "  -h, --help      Show this help message"
     echo
     echo "Architecture:"
     echo "  Client --HTTPS:8443--> Quay nginx (ssl.cert + ssl.key in config dir)"
@@ -47,15 +53,8 @@ usage() {
     echo "  3. Update POSTGRES_PASSWORD in quay-postgres.container to match DB_URI"
     echo
     echo "Admin user creation (first deploy only):"
-    echo "  QUAY_ADMIN_PASSWORD='yourpassword' $0"
+    echo "  QUAY_ADMIN_PASSWORD='yourpassword' $0 --cert /path/to/ssl.cert --key /path/to/ssl.key"
     echo "  (Skipped automatically if admin user already exists)"
-    echo
-    echo "Post-deployment (if first time):"
-    echo "  1. Update cloudflare.ini with your API token"
-    echo "  2. Run: cd $APP_DATA_DIR && ./setup_letsencrypt.sh"
-    echo "     (installs ssl.cert + ssl.key into config dir and restarts quay)"
-    echo "  3. Run: cd $APP_DATA_DIR && ./setup_renewal.sh"
-    echo "     (sets up automatic renewal via certbot deploy hook)"
     echo
     echo "Pull images through the registry:"
     echo "  podman pull quay.arvhomelab.com/docker.io/library/nginx:latest"
@@ -64,17 +63,51 @@ usage() {
     echo "  systemctl status quay-postgres.service quay-redis.service quay.service"
 }
 
-if [ "${1:-}" == "-h" ] || [ "${1:-}" == "--help" ]; then
-    usage
-    exit 0
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --cert)
+            CERT_FILE="${2:-}"
+            shift 2
+            ;;
+        --key)
+            KEY_FILE="${2:-}"
+            shift 2
+            ;;
+        *)
+            echo "✗ ERROR: Unknown argument: $1"
+            usage
+            exit 1
+            ;;
+    esac
+done
+
+# Validate cert/key: must be provided together
+if [ -n "$CERT_FILE" ] && [ -z "$KEY_FILE" ]; then
+    echo "✗ ERROR: --cert requires --key to also be specified"
+    exit 1
+fi
+if [ -z "$CERT_FILE" ] && [ -n "$KEY_FILE" ]; then
+    echo "✗ ERROR: --key requires --cert to also be specified"
+    exit 1
+fi
+if [ -n "$CERT_FILE" ] && [ ! -f "$CERT_FILE" ]; then
+    echo "✗ ERROR: Certificate file not found: $CERT_FILE"
+    exit 1
+fi
+if [ -n "$KEY_FILE" ] && [ ! -f "$KEY_FILE" ]; then
+    echo "✗ ERROR: Key file not found: $KEY_FILE"
+    exit 1
 fi
 
 echo "=== Deploying Quay container registry (local) ==="
 echo
 
 echo "Checking source files..."
-for f in "$POSTGRES_CONTAINER_FILE" "$REDIS_CONTAINER_FILE" "$QUAY_CONTAINER_FILE" \
-          "$LE_SETUP_SCRIPT" "$LE_RENEWAL_SCRIPT" "$CF_INI_FILE"; do
+for f in "$POSTGRES_CONTAINER_FILE" "$REDIS_CONTAINER_FILE" "$QUAY_CONTAINER_FILE"; do
     if [ ! -f "$f" ]; then
         echo "✗ ERROR: Source file '$f' not found in $SCRIPT_DIR"
         exit 1
@@ -103,11 +136,14 @@ echo "Installing Quay configuration files..."
 cp "$CONFIG_DIR/config.yaml" "$CONFIG_DEST_DIR/config.yaml"
 echo "✓ Copied Quay config to $CONFIG_DEST_DIR"
 
-echo "Installing Let's Encrypt scripts and Cloudflare config..."
-cp "$LE_SETUP_SCRIPT" "$LE_RENEWAL_SCRIPT" "$CF_INI_FILE" "$APP_DATA_DIR/"
-chmod +x "$APP_DATA_DIR/$LE_SETUP_SCRIPT" "$APP_DATA_DIR/$LE_RENEWAL_SCRIPT"
-chmod 600 "$APP_DATA_DIR/$CF_INI_FILE"
-echo "✓ Copied Let's Encrypt scripts and Cloudflare config to $APP_DATA_DIR"
+if [ -n "$CERT_FILE" ]; then
+    echo "Installing TLS certificates..."
+    cp "$CERT_FILE" "$CONFIG_DEST_DIR/ssl.cert"
+    cp "$KEY_FILE"  "$CONFIG_DEST_DIR/ssl.key"
+    chmod 644 "$CONFIG_DEST_DIR/ssl.cert"
+    chmod 600 "$CONFIG_DEST_DIR/ssl.key"
+    echo "✓ Installed ssl.cert and ssl.key into $CONFIG_DEST_DIR"
+fi
 
 echo "Setting permissions..."
 sudo chown -R arvin:arvin "$APP_DATA_DIR"
@@ -230,9 +266,9 @@ if [ -f "$CONFIG_DEST_DIR/ssl.cert" ] && [ -f "$CONFIG_DEST_DIR/ssl.key" ]; then
     echo "✓ TLS certificates found (ssl.cert + ssl.key) — Quay is serving HTTPS directly"
 else
     echo "⚠ TLS certificates not yet installed"
-    echo "  Run setup_letsencrypt.sh to obtain and install certificates:"
-    echo "    cd $APP_DATA_DIR && ./setup_letsencrypt.sh"
-    echo "  Quay will restart automatically after certificates are installed."
+    echo "  Re-run with --cert and --key to install certificates:"
+    echo "    $0 --cert /path/to/ssl.cert --key /path/to/ssl.key"
+    echo "  Quay will need to be restarted after certificates are installed."
 fi
 
 echo
@@ -260,7 +296,7 @@ STATUS=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 'https://192.168.
 if echo "$STATUS" | grep -qE "200"; then
     echo "✓ Quay HTTPS endpoint is responding (HTTP $STATUS)"
 else
-    echo "✗ Quay HTTPS endpoint not responding (HTTP $STATUS) — run setup_letsencrypt.sh first"
+    echo "✗ Quay HTTPS endpoint not responding (HTTP $STATUS) — ensure ssl.cert and ssl.key are installed"
 fi
 
 echo "Checking listening ports..."
@@ -282,8 +318,8 @@ echo "  Storage dir:   $STORAGE_DIR/"
 echo "  Postgres dir:  $POSTGRES_DIR/"
 echo
 echo "TLS certificate management:"
-echo "  Setup certs:   cd $APP_DATA_DIR && ./setup_letsencrypt.sh"
-echo "  Setup renewal: cd $APP_DATA_DIR && ./setup_renewal.sh"
+echo "  Install certs: $0 --cert /path/to/ssl.cert --key /path/to/ssl.key"
+echo "  Cert dir:      $CONFIG_DEST_DIR/  (ssl.cert + ssl.key)"
 echo
 echo "Pull images:"
 echo "  podman pull quay.arvhomelab.com/docker.io/library/nginx:latest"
