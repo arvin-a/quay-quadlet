@@ -3,7 +3,7 @@
 # Script to deploy Quay container registry to remote servers
 # This script:
 # 1. Deploys quay-postgres, quay-redis, quay .container files to /etc/containers/systemd/
-# 2. Copies config.yaml to /home/arvin/app-data/quay/config
+# 2. Copies config.yaml to /home/mariam/app-data/quay/config
 # 3. Copies Let's Encrypt scripts and Cloudflare credentials
 # 4. Creates data, storage, postgres, and redis dirs
 # 5. Reloads systemd, starts the services in order, and tests them
@@ -33,7 +33,7 @@ CF_INI_FILE="cloudflare.ini"
 REMOTE_USER="arvin"
 
 # Remote paths
-APP_DATA_DIR="/home/arvin/app-data/quay"
+APP_DATA_DIR="/home/mariam/app-data/quay"
 CONFIG_DEST_DIR="${APP_DATA_DIR}/config"
 STORAGE_DIR="${APP_DATA_DIR}/storage"
 POSTGRES_DIR="${APP_DATA_DIR}/postgres"
@@ -126,7 +126,7 @@ chmod 600 "$APP_DATA_DIR/$CF_INI_FILE"
 echo "✓ Copied Let's Encrypt scripts and Cloudflare config to $APP_DATA_DIR"
 
 echo "Setting permissions..."
-sudo chown -R arvin:arvin "$APP_DATA_DIR"
+sudo chown -R mariam:mariam "$APP_DATA_DIR"
 chmod 644 "$CONFIG_DEST_DIR/config.yaml"
 echo "✓ Permissions set"
 
@@ -331,9 +331,9 @@ usage() {
     echo
     echo "Post-deployment (if first time):"
     echo "  1. Update cloudflare.ini with your API token on the server"
-    echo "  2. Run: cd /home/arvin/app-data/quay && ./setup_letsencrypt.sh"
+    echo "  2. Run: cd /home/mariam/app-data/quay && ./setup_letsencrypt.sh"
     echo "     (installs ssl.cert + ssl.key into config dir and restarts quay)"
-    echo "  3. Run: cd /home/arvin/app-data/quay && ./setup_renewal.sh"
+    echo "  3. Run: cd /home/mariam/app-data/quay && ./setup_renewal.sh"
     echo "     (sets up automatic renewal via certbot deploy hook)"
     echo
     echo "Pull images through the registry:"

@@ -3,7 +3,7 @@
 # Script to deploy Quay container registry on the local machine
 # This script:
 # 1. Deploys quay-postgres, quay-redis, quay .container files to /etc/containers/systemd/
-# 2. Copies config.yaml to /home/arvin/app-data/quay/config
+# 2. Copies config.yaml to /home/mariam/app-data/quay/config
 # 3. Optionally installs user-provided TLS certificates
 # 4. Creates data, storage, postgres, and redis dirs
 # 5. Reloads systemd, starts the services in order, and tests them
@@ -23,7 +23,7 @@ QUAY_CONTAINER_FILE="quay.container"
 CONFIG_DIR="configs"
 
 # Local paths
-APP_DATA_DIR="/home/arvin/app-data/quay"
+APP_DATA_DIR="/home/mariam/app-data/quay"
 CONFIG_DEST_DIR="${APP_DATA_DIR}/config"
 STORAGE_DIR="${APP_DATA_DIR}/storage"
 POSTGRES_DIR="${APP_DATA_DIR}/postgres"
@@ -103,7 +103,10 @@ if [ -n "$KEY_FILE" ] && [ ! -f "$KEY_FILE" ]; then
     exit 1
 fi
 
+SERVER_IP=$(hostname -I | awk '{print $1}')
+
 echo "=== Deploying Quay container registry (local) ==="
+echo "Server IP: $SERVER_IP"
 echo
 
 echo "Checking source files..."
@@ -141,18 +144,43 @@ if [ -n "$CERT_FILE" ]; then
     cp "$CERT_FILE" "$CONFIG_DEST_DIR/ssl.cert"
     cp "$KEY_FILE"  "$CONFIG_DEST_DIR/ssl.key"
     chmod 644 "$CONFIG_DEST_DIR/ssl.cert"
-    chmod 600 "$CONFIG_DEST_DIR/ssl.key"
+    chmod 644 "$CONFIG_DEST_DIR/ssl.key"
     echo "✓ Installed ssl.cert and ssl.key into $CONFIG_DEST_DIR"
 fi
 
 echo "Setting permissions..."
-sudo chown -R arvin:arvin "$APP_DATA_DIR"
+sudo chown -R mariam:mariam "$APP_DATA_DIR"
 chmod 644 "$CONFIG_DEST_DIR/config.yaml"
 echo "✓ Permissions set"
 
 echo "Fixing postgres data directory ownership (UID 999 = postgres inside container)..."
 sudo chown -R 999:999 "$POSTGRES_DIR"
 echo "✓ Postgres data directory ownership set"
+
+echo "Configuring SELinux..."
+if command -v getenforce &>/dev/null && [ "$(getenforce)" != "Disabled" ]; then
+    # Allow containers to read/write the bind-mounted data directories
+    sudo semanage fcontext -a -t container_file_t "${APP_DATA_DIR}(/.*)?" 2>/dev/null || \
+        sudo semanage fcontext -m -t container_file_t "${APP_DATA_DIR}(/.*)?"
+    sudo restorecon -Rv "$APP_DATA_DIR"
+    # Allow containers to bind to the ports they use (8080, 8443, 5433, 6379)
+    for port in 8080 8443 5433 6379; do
+        sudo semanage port -a -t http_port_t -p tcp "$port" 2>/dev/null || true
+    done
+    echo "✓ SELinux contexts and port labels set"
+else
+    echo "  SELinux is disabled, skipping"
+fi
+
+echo "Configuring firewalld..."
+if systemctl is-active --quiet firewalld; then
+    sudo firewall-cmd --permanent --add-port=8080/tcp
+    sudo firewall-cmd --permanent --add-port=8443/tcp
+    sudo firewall-cmd --reload
+    echo "✓ firewalld: opened ports 8080/tcp and 8443/tcp"
+else
+    echo "  firewalld is not running, skipping"
+fi
 
 echo "Reloading systemd..."
 sudo systemctl daemon-reload
@@ -219,7 +247,7 @@ echo "Waiting for Quay to initialize (this may take up to 3 min on first run)...
 QUAY_READY=false
 for i in $(seq 1 18); do
     STATUS=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:8080/v2/ 2>/dev/null || echo 000)
-    if echo "$STATUS" | grep -qE '^(200|401|403)$'; then
+    if echo "$STATUS" | grep -qE '^(200|301|401|403)$'; then
         QUAY_READY=true
         echo "✓ Quay is responding (HTTP $STATUS) after $((i * 10))s"
         break
@@ -275,7 +303,7 @@ echo
 echo "Testing Quay registry locally..."
 
 echo "Testing Quay HTTP endpoint (direct, port 8080)..."
-STATUS=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 'http://192.168.4.19:8080/health' 2>/dev/null || echo '000')
+STATUS=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://${SERVER_IP}:8080/health" 2>/dev/null || echo '000')
 if echo "$STATUS" | grep -qE "200"; then
     echo "✓ Quay HTTP endpoint is responding (HTTP $STATUS)"
 else
@@ -284,7 +312,7 @@ else
 fi
 
 echo "Testing Quay v2 API (HTTP direct, port 8080)..."
-STATUS=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 'http://192.168.4.19:8080/v2/' 2>/dev/null || echo '000')
+STATUS=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://${SERVER_IP}:8080/v2/" 2>/dev/null || echo '000')
 if echo "$STATUS" | grep -qE "200|401"; then
     echo "✓ Quay v2 API is responding (HTTP $STATUS)"
 else
@@ -292,7 +320,7 @@ else
 fi
 
 echo "Testing Quay HTTPS endpoint (direct, port 8443)..."
-STATUS=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 'https://192.168.4.19:8443/health' 2>/dev/null || echo '000')
+STATUS=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 "https://${SERVER_IP}:8443/health" 2>/dev/null || echo '000')
 if echo "$STATUS" | grep -qE "200"; then
     echo "✓ Quay HTTPS endpoint is responding (HTTP $STATUS)"
 else
@@ -324,4 +352,4 @@ echo
 echo "Pull images:"
 echo "  podman pull quay.arvhomelab.com/docker.io/library/nginx:latest"
 echo
-echo "Web UI: https://quay.arvhomelab.com"
+echo "Web UI: https://${SERVER_IP}:8443"

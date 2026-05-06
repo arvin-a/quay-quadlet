@@ -9,7 +9,7 @@ Image=docker.io/library/postgres:15
 LogDriver=k8s-file
 PodmanArgs=--log-opt max-size=20m --log-opt max-files=3
 Network=host
-Volume=/home/arvin/app-data/quay/postgres:/var/lib/postgresql/data:Z
+Volume=/home/mariam/app-data/quay/postgres:/var/lib/postgresql/data:Z
 Environment=POSTGRES_USER=quay
 Environment=POSTGRES_PASSWORD=test
 Environment=POSTGRES_DB=quay

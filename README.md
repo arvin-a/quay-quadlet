@@ -41,9 +41,9 @@ Data directories created on the host at deploy time:
 
 | Path | Purpose |
 |---|---|
-| `/home/arvin/app-data/quay/config` | `config.yaml`, `ssl.cert`, `ssl.key` |
-| `/home/arvin/app-data/quay/storage` | OCI blob / image layer storage |
-| `/home/arvin/app-data/quay/postgres` | PostgreSQL data (owned by UID 999) |
+| `/home/mariam/app-data/quay/config` | `config.yaml`, `ssl.cert`, `ssl.key` |
+| `/home/mariam/app-data/quay/storage` | OCI blob / image layer storage |
+| `/home/mariam/app-data/quay/postgres` | PostgreSQL data (owned by UID 999) |
 
 ## Pre-deployment checklist
 
@@ -116,7 +116,7 @@ TLS is terminated directly by Quay. Certificates live in the config directory as
 **First-time setup** (after deploying):
 
 ```bash
-cd /home/arvin/app-data/quay
+cd /home/mariam/app-data/quay
 ./setup_letsencrypt.sh    # obtains cert via Certbot DNS-01 + Cloudflare, installs into config dir
 ./setup_renewal.sh        # registers a certbot deploy hook to restart quay on renewal
 ```

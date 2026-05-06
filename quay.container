@@ -12,8 +12,8 @@ LogDriver=k8s-file
 PodmanArgs=--log-opt max-size=50m --log-opt max-files=3
 Network=host
 Environment=IGNORE_VALIDATION=true
-Volume=/home/arvin/app-data/quay/config:/conf/stack:Z
-Volume=/home/arvin/app-data/quay/storage:/datastorage:Z
+Volume=/home/mariam/app-data/quay/config:/conf/stack:Z
+Volume=/home/mariam/app-data/quay/storage:/datastorage:Z
 
 [Service]
 Restart=always
