@@ -8,8 +8,8 @@ DATABASE_SECRET_KEY: test
 SECRET_KEY: test
 
 # PostgreSQL connection string
-# Password must match POSTGRES_PASSWORD in quay-postgres.container
-DB_URI: postgresql://quay:test@127.0.0.1:5433/quay
+# Password must match POSTGRESQL_PASSWORD in quay-postgres.container
+DB_URI: postgresql://quay:test@127.0.0.1:5432/quay
 
 # Public-facing hostname (no scheme, no port)
 SERVER_HOSTNAME: quay.arvhomelab.com:8443

@@ -5,16 +5,14 @@ Wants=systemd-networkd.socket network.target
 
 [Container]
 ContainerName=quay-postgres
-Image=docker.io/library/postgres:15
+Image=quay.io/sclorg/postgresql-15-c9s:latest
 LogDriver=k8s-file
 PodmanArgs=--log-opt max-size=20m --log-opt max-files=3
 Network=host
-Volume=/home/mariam/app-data/quay/postgres:/var/lib/postgresql/data:Z
-Environment=POSTGRES_USER=quay
-Environment=POSTGRES_PASSWORD=test
-Environment=POSTGRES_DB=quay
-Environment=PGDATA=/var/lib/postgresql/data/pgdata
-Environment=PGPORT=5433
+Volume=/home/mariam/app-data/quay/postgres:/var/lib/pgsql/data:Z
+Environment=POSTGRESQL_USER=quay
+Environment=POSTGRESQL_PASSWORD=test
+Environment=POSTGRESQL_DATABASE=quay
 
 [Service]
 Restart=always

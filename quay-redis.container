@@ -5,7 +5,7 @@ Wants=systemd-networkd.socket network.target
 
 [Container]
 ContainerName=quay-redis
-Image=docker.io/library/redis:7
+Image=quay.io/sclorg/redis-7-c9s:latest
 LogDriver=k8s-file
 PodmanArgs=--log-opt max-size=10m --log-opt max-files=3
 Network=host

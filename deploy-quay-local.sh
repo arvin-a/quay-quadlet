@@ -153,8 +153,8 @@ sudo chown -R mariam:mariam "$APP_DATA_DIR"
 chmod 644 "$CONFIG_DEST_DIR/config.yaml"
 echo "✓ Permissions set"
 
-echo "Fixing postgres data directory ownership (UID 999 = postgres inside container)..."
-sudo chown -R 999:999 "$POSTGRES_DIR"
+echo "Fixing postgres data directory ownership (UID 26 = postgres inside quay.io/sclorg/postgresql-15-c9s)..."
+sudo chown -R 26:26 "$POSTGRES_DIR"
 echo "✓ Postgres data directory ownership set"
 
 echo "Configuring SELinux..."
@@ -180,7 +180,7 @@ if command -v getenforce &>/dev/null && [ "$(getenforce)" != "Disabled" ]; then
         echo "✓ SELinux: removed :Z flags and set SecurityLabelDisable=true in container units"
     fi
     # Allow containers to bind to the ports they use (8080, 8443, 5433, 6379)
-    for port in 8080 8443 5433 6379; do
+    for port in 8080 8443 5432 6379; do
         sudo semanage port -a -t http_port_t -p tcp "$port" 2>/dev/null || true
     done
     echo "✓ SELinux contexts and port labels set"
@@ -216,7 +216,7 @@ echo "Starting quay-postgres service..."
 sudo systemctl start quay-postgres.service
 echo "Waiting for PostgreSQL to be ready..."
 for i in $(seq 1 12); do
-    if sudo podman exec quay-postgres pg_isready -U quay -d quay -q 2>/dev/null; then
+    if sudo podman exec quay-postgres pg_isready -U quay -d quay -h 127.0.0.1 -p 5432 -q 2>/dev/null; then
         echo "✓ PostgreSQL is accepting connections (attempt $i)"
         break
     fi
@@ -237,7 +237,8 @@ else
 fi
 
 echo "Ensuring required PostgreSQL extensions..."
-sudo podman exec quay-postgres psql -U quay -d quay -c 'CREATE EXTENSION IF NOT EXISTS pg_trgm;' || {
+sudo podman exec quay-postgres psql -U quay -d quay -c 'CREATE EXTENSION IF NOT EXISTS pg_trgm;' 2>/dev/null || \
+sudo podman exec --user root quay-postgres psql -U postgres -d quay -c 'CREATE EXTENSION IF NOT EXISTS pg_trgm;' || {
     echo "✗ ERROR: Failed to create pg_trgm extension"
     exit 1
 }
@@ -284,13 +285,13 @@ if [ "$QUAY_READY" = "false" ]; then
 fi
 
 # Create admin user if none exists yet
-ADMIN_EXISTS=$(podman exec quay-postgres psql -U quay -d quay -tAc "SELECT COUNT(*) FROM \"user\" WHERE username='admin';" 2>/dev/null || echo 0)
+ADMIN_EXISTS=$(sudo podman exec quay-postgres psql -U quay -d quay -tAc "SELECT COUNT(*) FROM \"user\" WHERE username='admin';" 2>/dev/null || echo 0)
 if [ "$ADMIN_EXISTS" = "0" ] && [ -n "${QUAY_ADMIN_PASSWORD:-}" ]; then
     echo "Creating admin user..."
-    HASH=$(podman exec "$(podman ps --filter 'ancestor=quay.io/projectquay/quay:latest' --format '{{.ID}}' | head -1)" \
+    HASH=$(sudo podman exec "$(sudo podman ps --filter 'ancestor=quay.io/projectquay/quay:latest' --format '{{.ID}}' | head -1)" \
         python3 -c "import bcrypt, sys; print(bcrypt.hashpw(sys.argv[1].encode(), bcrypt.gensalt(12)).decode())" \
         "${QUAY_ADMIN_PASSWORD:-}" 2>/dev/null)
-    podman exec quay-postgres psql -U quay -d quay -c "
+    sudo podman exec quay-postgres psql -U quay -d quay -c "
         INSERT INTO \"user\" (uuid, username, email, password_hash, verified, organization, robot,
                              invoice_email, invalid_login_attempts, last_invalid_login,
                              removed_tag_expiration_s, enabled, creation_date)
@@ -344,7 +345,7 @@ else
 fi
 
 echo "Checking listening ports..."
-sudo ss -tlnp | grep -E ':8080|:8443|:5433|:6379' | head -8 || true
+sudo ss -tlnp | grep -E ':8080|:8443|:5432|:6379' | head -8 || true
 
 echo
 echo "=========================================="
