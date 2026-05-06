@@ -32,15 +32,19 @@ POSTGRES_DIR="${APP_DATA_DIR}/postgres"
 CERT_FILE=""
 KEY_FILE=""
 
+# Admin password reset (optional, provided via --reset-admin-password)
+RESET_ADMIN_PASSWORD=""
+
 usage() {
-    echo "Usage: $0 [-h|--help] [--cert <cert-file>] [--key <key-file>]"
+    echo "Usage: $0 [-h|--help] [--cert <cert-file>] [--key <key-file>] [--reset-admin-password <password>]"
     echo
     echo "Deploy Quay container registry with direct TLS (no HAProxy) on the local machine."
     echo
     echo "Options:"
-    echo "  --cert <file>   Path to the TLS certificate file (PEM) to install as ssl.cert"
-    echo "  --key  <file>   Path to the TLS private key file (PEM) to install as ssl.key"
-    echo "  -h, --help      Show this help message"
+    echo "  --cert <file>                   Path to the TLS certificate file (PEM) to install as ssl.cert"
+    echo "  --key  <file>                   Path to the TLS private key file (PEM) to install as ssl.key"
+    echo "  --reset-admin-password <pass>   Reset the 'admin' user password in the database"
+    echo "  -h, --help                      Show this help message"
     echo
     echo "Architecture:"
     echo "  Client --HTTPS:8443--> Quay nginx (ssl.cert + ssl.key in config dir)"
@@ -50,11 +54,14 @@ usage() {
     echo "Pre-deployment (edit configs/config.yaml first):"
     echo "  1. Generate secrets: openssl rand -hex 32"
     echo "  2. Set DATABASE_SECRET_KEY, SECRET_KEY, and DB_URI password"
-    echo "  3. Update POSTGRES_PASSWORD in quay-postgres.container to match DB_URI"
+    echo "  3. Update POSTGRESQL_PASSWORD in quay-postgres.container to match DB_URI"
     echo
     echo "Admin user creation (first deploy only):"
     echo "  QUAY_ADMIN_PASSWORD='yourpassword' $0 --cert /path/to/ssl.cert --key /path/to/ssl.key"
     echo "  (Skipped automatically if admin user already exists)"
+    echo
+    echo "Reset admin password (services must be running):"
+    echo "  $0 --reset-admin-password 'newpassword'"
     echo
     echo "Pull images through the registry:"
     echo "  podman pull quay.arvhomelab.com/docker.io/library/nginx:latest"
@@ -75,6 +82,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --key)
             KEY_FILE="${2:-}"
+            shift 2
+            ;;
+        --reset-admin-password)
+            RESET_ADMIN_PASSWORD="${2:-}"
             shift 2
             ;;
         *)
@@ -101,6 +112,34 @@ fi
 if [ -n "$KEY_FILE" ] && [ ! -f "$KEY_FILE" ]; then
     echo "✗ ERROR: Key file not found: $KEY_FILE"
     exit 1
+fi
+
+# ── Reset admin password (standalone operation, skips full deploy) ──────────
+if [ -n "$RESET_ADMIN_PASSWORD" ]; then
+    echo "=== Resetting Quay admin password ==="
+    if ! systemctl is-active --quiet quay-postgres.service; then
+        echo "✗ ERROR: quay-postgres.service is not running"
+        exit 1
+    fi
+    QUAY_CONTAINER=$(sudo podman ps --filter 'ancestor=quay.io/projectquay/quay:latest' --format '{{.ID}}' | head -1)
+    if [ -z "$QUAY_CONTAINER" ]; then
+        echo "✗ ERROR: Quay container is not running"
+        exit 1
+    fi
+    HASH=$(sudo podman exec "$QUAY_CONTAINER" \
+        python3 -c "import bcrypt, sys; print(bcrypt.hashpw(sys.argv[1].encode(), bcrypt.gensalt(12)).decode())" \
+        "$RESET_ADMIN_PASSWORD" 2>/dev/null)
+    if [ -z "$HASH" ]; then
+        echo "✗ ERROR: Failed to generate bcrypt hash (is the quay container running?)"
+        exit 1
+    fi
+    sudo podman exec quay-postgres psql -U quay -d quay -c \
+        "UPDATE \"user\" SET password_hash='${HASH}', invalid_login_attempts=0 WHERE username='admin';" \
+        && echo "✓ Admin password reset successfully (username: admin)" \
+        || { echo "✗ ERROR: Database update failed"; exit 1; }
+    echo "  Restart quay to ensure session caches are cleared:"
+    echo "  sudo systemctl restart quay.service"
+    exit 0
 fi
 
 SERVER_IP=$(hostname -I | awk '{print $1}')
@@ -295,7 +334,7 @@ if [ "$ADMIN_EXISTS" = "0" ] && [ -n "${QUAY_ADMIN_PASSWORD:-}" ]; then
         INSERT INTO \"user\" (uuid, username, email, password_hash, verified, organization, robot,
                              invoice_email, invalid_login_attempts, last_invalid_login,
                              removed_tag_expiration_s, enabled, creation_date)
-        VALUES (gen_random_uuid(), 'admin', 'admin@arvhomelab.com', '\$HASH',
+        VALUES (gen_random_uuid(), 'admin', 'admin@mariamhomelab.com', '\$HASH',
                 true, false, false, false, 0, NOW(), 1209600, true, NOW())
         ON CONFLICT (username) DO NOTHING;
     " && echo "✓ Admin user created (username: admin)" || echo "⚠ Could not create admin user"
