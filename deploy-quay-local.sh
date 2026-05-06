@@ -28,6 +28,11 @@ CONFIG_DEST_DIR="${APP_DATA_DIR}/config"
 STORAGE_DIR="${APP_DATA_DIR}/storage"
 POSTGRES_DIR="${APP_DATA_DIR}/postgres"
 
+# UID of the postgres process inside the postgres container image.
+# Detected dynamically below for the quay image; this is the fallback.
+QUAY_UID=1001
+POSTGRES_UID=26
+
 # Certificate paths (optional, provided via --cert / --key)
 CERT_FILE=""
 KEY_FILE=""
@@ -63,8 +68,11 @@ usage() {
     echo "Reset admin password (services must be running):"
     echo "  $0 --reset-admin-password 'newpassword'"
     echo
-    echo "Pull images through the registry:"
-    echo "  podman pull quay.arvhomelab.com/docker.io/library/nginx:latest"
+    echo "Login / push / pull (port :8443 required in every command):"
+    echo "  podman login quay.arvhomelab.com:8443 -u admin"
+    echo "  podman tag myimage:latest quay.arvhomelab.com:8443/<org>/<repo>:tag"
+    echo "  podman push quay.arvhomelab.com:8443/<org>/<repo>:tag"
+    echo "  podman pull quay.arvhomelab.com:8443/<org>/<repo>:tag"
     echo
     echo "Check service status:"
     echo "  systemctl status quay-postgres.service quay-redis.service quay.service"
@@ -168,11 +176,29 @@ sudo cp "$REDIS_CONTAINER_FILE"    "/etc/containers/systemd/$REDIS_CONTAINER_FIL
 sudo cp "$QUAY_CONTAINER_FILE"     "/etc/containers/systemd/$QUAY_CONTAINER_FILE"
 echo "✓ Copied container files to /etc/containers/systemd/"
 
+echo "Verifying storage Volume= mount in quay.container..."
+INSTALLED_QUAY_UNIT="/etc/containers/systemd/$QUAY_CONTAINER_FILE"
+if sudo grep -q "Volume=.*${STORAGE_DIR}.*:/datastorage" "$INSTALLED_QUAY_UNIT" 2>/dev/null; then
+    echo "✓ Storage volume mount found in $QUAY_CONTAINER_FILE"
+elif sudo grep -q "Volume=.*:/datastorage" "$INSTALLED_QUAY_UNIT" 2>/dev/null; then
+    CURRENT_VOL=$(sudo grep "Volume=.*:/datastorage" "$INSTALLED_QUAY_UNIT" | head -1)
+    echo "⚠ Storage volume mount exists but points to a different host path:"
+    echo "  Found:    $CURRENT_VOL"
+    echo "  Expected: Volume=${STORAGE_DIR}:/datastorage:Z"
+    echo "  Updating to correct path..."
+    sudo sed -i "s|Volume=.*:/datastorage.*|Volume=${STORAGE_DIR}:/datastorage:Z|" "$INSTALLED_QUAY_UNIT"
+    echo "✓ Storage volume mount updated"
+else
+    echo "⚠ No datastorage Volume= line found — adding it now (blobs cannot be written without this)"
+    sudo sed -i "/^\[Container\]/a Volume=${STORAGE_DIR}:/datastorage:Z" "$INSTALLED_QUAY_UNIT"
+    echo "✓ Added: Volume=${STORAGE_DIR}:/datastorage:Z"
+fi
+
 echo "Creating directories..."
 mkdir -p "$CONFIG_DEST_DIR"
-mkdir -p "$STORAGE_DIR"
+mkdir -p "$STORAGE_DIR/registry"
 mkdir -p "$POSTGRES_DIR"
-echo "✓ Created $APP_DATA_DIR"
+echo "✓ Created $APP_DATA_DIR (including storage/registry subdirectory)"
 
 echo "Installing Quay configuration files..."
 cp "$CONFIG_DIR/config.yaml" "$CONFIG_DEST_DIR/config.yaml"
@@ -187,14 +213,75 @@ if [ -n "$CERT_FILE" ]; then
     echo "✓ Installed ssl.cert and ssl.key into $CONFIG_DEST_DIR"
 fi
 
+# Register the TLS cert with podman and the system trust store so that
+# 'podman login' works without --tls-verify=false.
+# Uses the cert already in the config dir (installed above, or from a previous run).
+QUAY_CERT="${CONFIG_DEST_DIR}/ssl.cert"
+if [ -f "$QUAY_CERT" ]; then
+    echo "Registering Quay TLS cert with podman and system trust store..."
+    _SH=$(grep -E '^SERVER_HOSTNAME:' "$CONFIG_DIR/config.yaml" 2>/dev/null | awk '{print $2}' | tr -d '"' || echo "quay.arvhomelab.com:8443")
+    QUAY_HOSTNAME_ONLY=$(echo "$_SH" | cut -d: -f1)
+    QUAY_PORT=$(echo "$_SH" | cut -s -d: -f2); QUAY_PORT="${QUAY_PORT:-443}"
+    QUAY_CERTS_DIR="/etc/containers/certs.d/${QUAY_HOSTNAME_ONLY}:${QUAY_PORT}"
+    sudo mkdir -p "$QUAY_CERTS_DIR"
+    sudo cp "$QUAY_CERT" "${QUAY_CERTS_DIR}/ca.crt"
+    echo "✓ Cert registered at ${QUAY_CERTS_DIR}/ca.crt (podman will trust it)"
+    sudo cp "$QUAY_CERT" /etc/pki/ca-trust/source/anchors/quay-${QUAY_HOSTNAME_ONLY}.crt
+    sudo update-ca-trust extract
+    echo "✓ Cert added to system trust store (curl, browsers, oc will trust it)"
+else
+    echo "⚠ No ssl.cert found — skipping cert trust registration"
+    echo "  Re-run with --cert and --key to install certificates"
+fi
+
+echo "Detecting Quay container UID from image..."
+DETECTED_QUAY_UID=$(sudo podman image inspect quay.io/projectquay/quay:latest \
+    --format '{{.Config.User}}' 2>/dev/null | tr -d '"' | cut -d: -f1)
+if [[ "$DETECTED_QUAY_UID" =~ ^[0-9]+$ ]]; then
+    QUAY_UID="$DETECTED_QUAY_UID"
+    echo "✓ Quay image UID detected: ${QUAY_UID}"
+else
+    echo "  Could not detect UID from image metadata (got: '${DETECTED_QUAY_UID}'), using default: ${QUAY_UID}"
+fi
+
+echo "Detecting Postgres container UID from image..."
+QUAY_POSTGRES_IMAGE=$(grep -E '^Image=' "/etc/containers/systemd/$POSTGRES_CONTAINER_FILE" 2>/dev/null | head -1 | cut -d= -f2)
+DETECTED_PG_UID=$(sudo podman image inspect "${QUAY_POSTGRES_IMAGE:-quay.io/sclorg/postgresql-15-c9s}" \
+    --format '{{.Config.User}}' 2>/dev/null | tr -d '"' | cut -d: -f1)
+if [[ "$DETECTED_PG_UID" =~ ^[0-9]+$ ]]; then
+    POSTGRES_UID="$DETECTED_PG_UID"
+    echo "✓ Postgres image UID detected: ${POSTGRES_UID}"
+else
+    echo "  Could not detect UID from postgres image, using default: ${POSTGRES_UID}"
+fi
+
 echo "Setting permissions..."
 sudo chown -R mariam:mariam "$APP_DATA_DIR"
 chmod 644 "$CONFIG_DEST_DIR/config.yaml"
-echo "✓ Permissions set"
+echo "✓ Base permissions set"
 
-echo "Fixing postgres data directory ownership (UID 26 = postgres inside quay.io/sclorg/postgresql-15-c9s)..."
-sudo chown -R 26:26 "$POSTGRES_DIR"
-echo "✓ Postgres data directory ownership set"
+echo "Fixing storage directory ownership (UID ${QUAY_UID} = quay user inside container)..."
+sudo chown -R "${QUAY_UID}:${QUAY_UID}" "$STORAGE_DIR"
+ACTUAL_UID=$(stat -c '%u' "$STORAGE_DIR" 2>/dev/null)
+if [ "$ACTUAL_UID" = "$QUAY_UID" ]; then
+    echo "✓ Storage directory ownership set to UID ${QUAY_UID}"
+else
+    echo "⚠ chown to UID ${QUAY_UID} did not take effect (actual UID: ${ACTUAL_UID})"
+    echo "  Filesystem may not support chown to unmapped UIDs — setting 777 as fallback:"
+    sudo chmod -R 777 "$STORAGE_DIR"
+    echo "✓ Storage set to world-writable (777)"
+fi
+
+echo "Fixing postgres data directory ownership (UID ${POSTGRES_UID} = postgres user inside container)..."
+sudo chown -R "${POSTGRES_UID}:${POSTGRES_UID}" "$POSTGRES_DIR"
+ACTUAL_PG_UID=$(stat -c '%u' "$POSTGRES_DIR" 2>/dev/null)
+if [ "$ACTUAL_PG_UID" = "$POSTGRES_UID" ]; then
+    echo "✓ Postgres directory ownership set to UID ${POSTGRES_UID}"
+else
+    echo "⚠ chown to UID ${POSTGRES_UID} did not take effect — setting 777 as fallback:"
+    sudo chmod -R 777 "$POSTGRES_DIR"
+    echo "✓ Postgres dir set to world-writable (777)"
+fi
 
 echo "Configuring SELinux..."
 SELINUX_XATTR_OK=false
@@ -323,6 +410,45 @@ if [ "$QUAY_READY" = "false" ]; then
     exit 1
 fi
 
+echo "Verifying storage is writable from inside the Quay container..."
+STORAGE_TEST_FILE="/datastorage/registry/.write-test"
+if sudo podman exec quay sh -c "touch ${STORAGE_TEST_FILE} && rm -f ${STORAGE_TEST_FILE}" 2>/dev/null; then
+    echo "✓ Storage is writable — blob uploads will work"
+else
+    echo "⚠ Storage not writable — detecting actual Quay process UID and fixing ownership..."
+    RUNTIME_QUAY_UID=$(sudo podman exec quay id -u 2>/dev/null || echo "")
+    if [[ "$RUNTIME_QUAY_UID" =~ ^[0-9]+$ ]]; then
+        echo "  Quay process runs as UID ${RUNTIME_QUAY_UID} inside the container"
+        sudo chown -R "${RUNTIME_QUAY_UID}:${RUNTIME_QUAY_UID}" "$STORAGE_DIR"
+        ACTUAL_UID=$(stat -c '%u' "$STORAGE_DIR" 2>/dev/null)
+        if [ "$ACTUAL_UID" = "$RUNTIME_QUAY_UID" ]; then
+            echo "✓ Storage ownership corrected to UID ${RUNTIME_QUAY_UID}"
+        else
+            echo "  chown not supported on this filesystem — setting 777 as fallback:"
+            sudo chmod -R 777 "$STORAGE_DIR"
+            echo "✓ Storage set to 777 (world-writable)"
+        fi
+    else
+        echo "  Could not detect runtime UID — setting 777 as fallback:"
+        sudo chmod -R 777 "$STORAGE_DIR"
+        echo "✓ Storage set to 777 (world-writable)"
+    fi
+    echo "  Restarting Quay to pick up ownership change..."
+    sudo systemctl restart quay.service
+    sleep 15
+    if sudo podman exec quay sh -c "touch ${STORAGE_TEST_FILE} && rm -f ${STORAGE_TEST_FILE}" 2>/dev/null; then
+        echo "✓ Storage is now writable — blob uploads will work"
+    else
+        echo "✗ ERROR: Storage still not writable after fix."
+        echo "  Mount state:"
+        sudo podman inspect quay --format \
+            '{{range .Mounts}}  {{.Type}} {{.Source}} -> {{.Destination}}{{println}}{{end}}' 2>/dev/null || true
+        echo "  Host storage permissions:"
+        ls -lan "$STORAGE_DIR/"
+        exit 1
+    fi
+fi
+
 # Create admin user if none exists yet
 ADMIN_EXISTS=$(sudo podman exec quay-postgres psql -U quay -d quay -tAc "SELECT COUNT(*) FROM \"user\" WHERE username='admin';" 2>/dev/null || echo 0)
 if [ "$ADMIN_EXISTS" = "0" ] && [ -n "${QUAY_ADMIN_PASSWORD:-}" ]; then
@@ -334,7 +460,7 @@ if [ "$ADMIN_EXISTS" = "0" ] && [ -n "${QUAY_ADMIN_PASSWORD:-}" ]; then
         INSERT INTO \"user\" (uuid, username, email, password_hash, verified, organization, robot,
                              invoice_email, invalid_login_attempts, last_invalid_login,
                              removed_tag_expiration_s, enabled, creation_date)
-        VALUES (gen_random_uuid(), 'admin', 'admin@mariamhomelab.com', '\$HASH',
+        VALUES (gen_random_uuid(), 'admin', 'admin@mariamhomelab.com', '${HASH}',
                 true, false, false, false, 0, NOW(), 1209600, true, NOW())
         ON CONFLICT (username) DO NOTHING;
     " && echo "✓ Admin user created (username: admin)" || echo "⚠ Could not create admin user"
