@@ -158,11 +158,27 @@ sudo chown -R 999:999 "$POSTGRES_DIR"
 echo "✓ Postgres data directory ownership set"
 
 echo "Configuring SELinux..."
+SELINUX_XATTR_OK=false
 if command -v getenforce &>/dev/null && [ "$(getenforce)" != "Disabled" ]; then
     # Allow containers to read/write the bind-mounted data directories
-    sudo semanage fcontext -a -t container_file_t "${APP_DATA_DIR}(/.*)?" 2>/dev/null || \
-        sudo semanage fcontext -m -t container_file_t "${APP_DATA_DIR}(/.*)?"
-    sudo restorecon -Rv "$APP_DATA_DIR"
+    if sudo chcon -Rt container_file_t "$APP_DATA_DIR" 2>/dev/null; then
+        SELINUX_XATTR_OK=true
+        echo "✓ SELinux: chcon applied to $APP_DATA_DIR"
+        sudo semanage fcontext -a -t container_file_t "${APP_DATA_DIR}(/.*)?" 2>/dev/null || \
+            sudo semanage fcontext -m -t container_file_t "${APP_DATA_DIR}(/.*)?"
+        sudo restorecon -Rv "$APP_DATA_DIR" 2>/dev/null || true
+    else
+        echo "⚠ SELinux: filesystem does not support xattrs — disabling SELinux label enforcement for containers"
+        # Remove :Z volume label flags and add --security-opt label=disable so containers
+        # are not blocked from accessing mounts on filesystems without xattr support
+        for f in "/etc/containers/systemd/$QUAY_CONTAINER_FILE" \
+                 "/etc/containers/systemd/$POSTGRES_CONTAINER_FILE" \
+                 "/etc/containers/systemd/$REDIS_CONTAINER_FILE"; do
+            sudo sed -i 's/:Z\b//g' "$f"
+            sudo sed -i '/^\[Container\]/a SecurityLabelDisable=true' "$f"
+        done
+        echo "✓ SELinux: removed :Z flags and set SecurityLabelDisable=true in container units"
+    fi
     # Allow containers to bind to the ports they use (8080, 8443, 5433, 6379)
     for port in 8080 8443 5433 6379; do
         sudo semanage port -a -t http_port_t -p tcp "$port" 2>/dev/null || true
