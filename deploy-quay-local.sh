@@ -2,12 +2,15 @@
 
 # Script to deploy Quay container registry on the local machine
 # This script:
-# 1. Deploys quay-postgres, quay-redis, quay .container files to /etc/containers/systemd/
-# 2. Copies config.yaml to /home/mariam/app-data/quay/config
-# 3. Optionally installs user-provided TLS certificates
-# 4. Creates data, storage, postgres, and redis dirs
-# 5. Reloads systemd, starts the services in order, and tests them
+# 1. Deploys quay-postgres, quay-pgbouncer, quay-redis, quay .container files to /etc/containers/systemd/
+# 2. Generates pgbouncer.ini and userlist.txt from DB_URI in config.yaml
+# 3. Rewrites DB_URI in the deployed config.yaml to route through PgBouncer
+# 4. Copies config.yaml to /home/mariam/app-data/quay/config
+# 5. Optionally installs user-provided TLS certificates
+# 6. Creates data, storage, postgres, pgbouncer, and redis dirs
+# 7. Reloads systemd, starts services in order (postgres → pgbouncer → redis → quay), and tests them
 #
+# Connection flow: Quay --> PgBouncer :6432 (transaction pooling) --> PostgreSQL :5432
 # TLS is terminated directly by Quay (ssl.cert + ssl.key in config dir).
 # Pass --cert and --key to install your own certificates during deployment.
 
@@ -27,6 +30,9 @@ APP_DATA_DIR="/home/mariam/app-data/quay"
 CONFIG_DEST_DIR="${APP_DATA_DIR}/config"
 STORAGE_DIR="${APP_DATA_DIR}/storage"
 POSTGRES_DIR="${APP_DATA_DIR}/postgres"
+PGBOUNCER_DIR="${APP_DATA_DIR}/pgbouncer"
+PGBOUNCER_PORT=6432
+PGBOUNCER_CONTAINER_FILE="quay-pgbouncer.container"
 
 # UID of the postgres process inside the postgres container image.
 # Detected dynamically below for the quay image; this is the fallback.
@@ -54,7 +60,8 @@ usage() {
     echo "Architecture:"
     echo "  Client --HTTPS:8443--> Quay nginx (ssl.cert + ssl.key in config dir)"
     echo "  Client --HTTP:8080 --> Quay nginx (unencrypted, internal use only)"
-    echo "  PostgreSQL and Redis are internal only"
+    echo "  Quay --> PgBouncer :${PGBOUNCER_PORT} (connection pooler) --> PostgreSQL :5432"
+    echo "  Redis is internal only"
     echo
     echo "Pre-deployment (edit configs/config.yaml first):"
     echo "  1. Generate secrets: openssl rand -hex 32"
@@ -75,7 +82,7 @@ usage() {
     echo "  podman pull quay.arvhomelab.com:8443/<org>/<repo>:tag"
     echo
     echo "Check service status:"
-    echo "  systemctl status quay-postgres.service quay-redis.service quay.service"
+    echo "  systemctl status quay-postgres.service quay-pgbouncer.service quay-redis.service quay.service"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -176,6 +183,36 @@ sudo cp "$REDIS_CONTAINER_FILE"    "/etc/containers/systemd/$REDIS_CONTAINER_FIL
 sudo cp "$QUAY_CONTAINER_FILE"     "/etc/containers/systemd/$QUAY_CONTAINER_FILE"
 echo "✓ Copied container files to /etc/containers/systemd/"
 
+echo "Generating PgBouncer container unit file..."
+sudo tee "/etc/containers/systemd/$PGBOUNCER_CONTAINER_FILE" > /dev/null <<EOF
+[Unit]
+Description=PgBouncer connection pooler for Quay
+After=quay-postgres.service
+Requires=quay-postgres.service
+
+[Container]
+Image=docker.io/edoburu/pgbouncer:latest
+ContainerName=quay-pgbouncer
+Network=host
+Volume=${PGBOUNCER_DIR}:/etc/pgbouncer:Z
+Environment=LISTEN_PORT=${PGBOUNCER_PORT}
+Environment=DB_HOST=127.0.0.1
+Environment=DB_PORT=5432
+Environment=POOL_MODE=transaction
+Environment=MAX_CLIENT_CONN=500
+Environment=DEFAULT_POOL_SIZE=40
+Environment=SERVER_RESET_QUERY=DISCARD ALL
+Environment=AUTH_TYPE=scram-sha-256
+
+[Service]
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target default.target
+EOF
+echo "✓ Generated /etc/containers/systemd/$PGBOUNCER_CONTAINER_FILE"
+
 echo "Verifying storage Volume= mount in quay.container..."
 INSTALLED_QUAY_UNIT="/etc/containers/systemd/$QUAY_CONTAINER_FILE"
 if sudo grep -q "Volume=.*${STORAGE_DIR}.*:/datastorage" "$INSTALLED_QUAY_UNIT" 2>/dev/null; then
@@ -198,11 +235,74 @@ echo "Creating directories..."
 mkdir -p "$CONFIG_DEST_DIR"
 mkdir -p "$STORAGE_DIR/registry"
 mkdir -p "$POSTGRES_DIR"
-echo "✓ Created $APP_DATA_DIR (including storage/registry subdirectory)"
+mkdir -p "$PGBOUNCER_DIR"
+echo "✓ Created $APP_DATA_DIR (including storage/registry, postgres, pgbouncer subdirectories)"
 
 echo "Installing Quay configuration files..."
 cp "$CONFIG_DIR/config.yaml" "$CONFIG_DEST_DIR/config.yaml"
 echo "✓ Copied Quay config to $CONFIG_DEST_DIR"
+
+# Extract DB credentials from config.yaml (DB_URI: postgresql://user:pass@host:port/db)
+echo "Extracting database credentials from config.yaml..."
+DB_URI_LINE=$(grep -E '^DB_URI:' "$CONFIG_DIR/config.yaml" | head -1)
+DB_USER=$(echo "$DB_URI_LINE" | sed 's|.*://\([^:]*\):.*|\1|')
+DB_PASS=$(echo "$DB_URI_LINE" | sed 's|.*://[^:]*:\([^@]*\)@.*|\1|')
+DB_NAME=$(echo "$DB_URI_LINE" | sed 's|.*/\([^?]*\).*|\1|')
+if [ -z "$DB_USER" ] || [ -z "$DB_PASS" ] || [ -z "$DB_NAME" ]; then
+    echo "✗ ERROR: Could not parse DB_URI from configs/config.yaml"
+    echo "  Expected format: DB_URI: postgresql://user:password@host:port/dbname"
+    exit 1
+fi
+echo "✓ Parsed DB credentials (user: ${DB_USER}, db: ${DB_NAME})"
+
+echo "Generating PgBouncer configuration files..."
+# pgbouncer.ini
+cat > "${PGBOUNCER_DIR}/pgbouncer.ini" <<EOF
+[databases]
+${DB_NAME} = host=127.0.0.1 port=5432 dbname=${DB_NAME}
+
+[pgbouncer]
+listen_addr = 127.0.0.1
+listen_port = ${PGBOUNCER_PORT}
+auth_file = /etc/pgbouncer/userlist.txt
+auth_type = scram-sha-256
+pool_mode = transaction
+max_client_conn = 500
+default_pool_size = 40
+min_pool_size = 5
+reserve_pool_size = 10
+reserve_pool_timeout = 5
+server_reset_query = DISCARD ALL
+server_check_delay = 30
+server_idle_timeout = 600
+client_idle_timeout = 300
+log_connections = 0
+log_disconnections = 0
+log_pooler_errors = 1
+stats_period = 60
+EOF
+
+# userlist.txt — PgBouncer needs the plain password for scram-sha-256 lookup
+# We store it quoted as required by PgBouncer
+cat > "${PGBOUNCER_DIR}/userlist.txt" <<EOF
+"${DB_USER}" "${DB_PASS}"
+EOF
+
+chmod 600 "${PGBOUNCER_DIR}/userlist.txt"
+chmod 644 "${PGBOUNCER_DIR}/pgbouncer.ini"
+echo "✓ Generated ${PGBOUNCER_DIR}/pgbouncer.ini and userlist.txt"
+
+# Rewrite DB_URI in the deployed config.yaml to route through PgBouncer
+echo "Updating DB_URI in deployed config.yaml to use PgBouncer (port ${PGBOUNCER_PORT})..."
+sed -i "s|postgresql://${DB_USER}:${DB_PASS}@[^/]*/${DB_NAME}|postgresql://${DB_USER}:${DB_PASS}@127.0.0.1:${PGBOUNCER_PORT}/${DB_NAME}|" \
+    "$CONFIG_DEST_DIR/config.yaml"
+# Verify the rewrite took effect
+if grep -q ":${PGBOUNCER_PORT}/" "$CONFIG_DEST_DIR/config.yaml"; then
+    echo "✓ DB_URI now points to PgBouncer at 127.0.0.1:${PGBOUNCER_PORT}"
+else
+    echo "⚠ Could not auto-update DB_URI — update manually in $CONFIG_DEST_DIR/config.yaml:"
+    echo "  Change the port in DB_URI from 5432 to ${PGBOUNCER_PORT}"
+fi
 
 if [ -n "$CERT_FILE" ]; then
     echo "Installing TLS certificates..."
@@ -299,14 +399,15 @@ if command -v getenforce &>/dev/null && [ "$(getenforce)" != "Disabled" ]; then
         # are not blocked from accessing mounts on filesystems without xattr support
         for f in "/etc/containers/systemd/$QUAY_CONTAINER_FILE" \
                  "/etc/containers/systemd/$POSTGRES_CONTAINER_FILE" \
-                 "/etc/containers/systemd/$REDIS_CONTAINER_FILE"; do
+                 "/etc/containers/systemd/$REDIS_CONTAINER_FILE" \
+                 "/etc/containers/systemd/$PGBOUNCER_CONTAINER_FILE"; do
             sudo sed -i 's/:Z\b//g' "$f"
             sudo sed -i '/^\[Container\]/a SecurityLabelDisable=true' "$f"
         done
         echo "✓ SELinux: removed :Z flags and set SecurityLabelDisable=true in container units"
     fi
-    # Allow containers to bind to the ports they use (8080, 8443, 5433, 6379)
-    for port in 8080 8443 5432 6379; do
+    # Allow containers to bind to the ports they use
+    for port in 8080 8443 5432 6379 ${PGBOUNCER_PORT}; do
         sudo semanage port -a -t http_port_t -p tcp "$port" 2>/dev/null || true
     done
     echo "✓ SELinux contexts and port labels set"
@@ -329,7 +430,7 @@ sudo systemctl daemon-reload
 echo "✓ Systemd daemon reloaded"
 
 # Stop services and reset any failure state (reverse dependency order)
-for svc in quay.service quay-redis.service quay-postgres.service; do
+for svc in quay.service quay-redis.service quay-pgbouncer.service quay-postgres.service; do
     sudo systemctl stop "$svc" 2>/dev/null || true
     sudo systemctl reset-failed "$svc" 2>/dev/null || true
 done
@@ -359,6 +460,37 @@ if systemctl is-active --quiet quay-postgres.service; then
 else
     echo "✗ ERROR: quay-postgres service failed to start"
     sudo journalctl -u quay-postgres.service -n 20 --no-pager
+    exit 1
+fi
+
+echo "Starting quay-pgbouncer service..."
+sudo systemctl start quay-pgbouncer.service
+echo "Waiting for PgBouncer to be ready..."
+for i in $(seq 1 12); do
+    if sudo podman exec quay-pgbouncer psql \
+        "postgresql://${DB_USER}:${DB_PASS}@127.0.0.1:${PGBOUNCER_PORT}/${DB_NAME}" \
+        -c "SELECT 1" -q 2>/dev/null | grep -q 1; then
+        echo "✓ PgBouncer is accepting connections (attempt $i)"
+        break
+    fi
+    # Fallback: check the port is open
+    if nc -z 127.0.0.1 "${PGBOUNCER_PORT}" 2>/dev/null; then
+        echo "✓ PgBouncer port ${PGBOUNCER_PORT} is open (attempt $i)"
+        break
+    fi
+    if [ "$i" -eq 12 ]; then
+        echo "✗ ERROR: PgBouncer did not become ready in time"
+        sudo journalctl -u quay-pgbouncer.service -n 20 --no-pager
+        exit 1
+    fi
+    sleep 5
+done
+
+if systemctl is-active --quiet quay-pgbouncer.service; then
+    echo "✓ quay-pgbouncer service is running"
+else
+    echo "✗ ERROR: quay-pgbouncer service failed to start"
+    sudo journalctl -u quay-pgbouncer.service -n 20 --no-pager
     exit 1
 fi
 
@@ -510,7 +642,7 @@ else
 fi
 
 echo "Checking listening ports..."
-sudo ss -tlnp | grep -E ':8080|:8443|:5432|:6379' | head -8 || true
+sudo ss -tlnp | grep -E ":8080|:8443|:5432|:${PGBOUNCER_PORT}|:6379" | head -10 || true
 
 echo
 echo "=========================================="
@@ -518,14 +650,17 @@ echo "=== Deployment Complete ==="
 echo "=========================================="
 echo
 echo "Useful commands:"
-echo "  Check status:  systemctl status quay-postgres.service quay-redis.service quay.service"
+echo "  Check status:  systemctl status quay-postgres.service quay-pgbouncer.service quay-redis.service quay.service"
 echo "  View logs:     sudo journalctl -u quay.service -f"
+echo "                 sudo journalctl -u quay-pgbouncer.service -f"
 echo "                 sudo journalctl -u quay-postgres.service -f"
-echo "  Restart all:   sudo systemctl restart quay-postgres.service quay-redis.service quay.service"
-echo "  Stop all:      sudo systemctl stop quay.service quay-redis.service quay-postgres.service"
+echo "  Restart all:   sudo systemctl restart quay-postgres.service quay-pgbouncer.service quay-redis.service quay.service"
+echo "  Stop all:      sudo systemctl stop quay.service quay-redis.service quay-pgbouncer.service quay-postgres.service"
+echo "  PgBouncer stats: sudo podman exec quay-pgbouncer psql -p ${PGBOUNCER_PORT} -U ${DB_USER:-quay} pgbouncer -c 'SHOW POOLS;'"
 echo "  Config dir:    $CONFIG_DEST_DIR/"
 echo "  Storage dir:   $STORAGE_DIR/"
 echo "  Postgres dir:  $POSTGRES_DIR/"
+echo "  PgBouncer dir: $PGBOUNCER_DIR/"
 echo
 echo "TLS certificate management:"
 echo "  Install certs: $0 --cert /path/to/ssl.cert --key /path/to/ssl.key"

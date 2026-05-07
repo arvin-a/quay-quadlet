@@ -71,3 +71,23 @@ FEATURE_APP_SPECIFIC_TOKENS: true
 # Login timeout
 FRESH_LOGIN_TIMEOUT: 10m
 MAXIMUM_LAYER_SIZE: 20G
+
+# ── Performance tuning (production / bare-metal) ──────────────────────────
+# Database connection pool
+# pool_size:    sustained connections per gunicorn worker
+# max_overflow: burst connections above pool_size
+# Ensure PostgreSQL max_connections > (WORKER_COUNT_REGISTRY * (pool_size + max_overflow))
+DB_CONNECTION_ARGS:
+  pool_size: 30
+  max_overflow: 50
+  pool_timeout: 30
+  pool_recycle: 1800
+  pool_pre_ping: true
+
+# Gunicorn worker counts — set to match CPU core count for registry workers
+# Registry workers handle push/pull; web workers handle UI and API
+WORKER_COUNT: 8
+WORKER_COUNT_REGISTRY: 16
+
+# Increase gunicorn timeout to handle large layer uploads without 502
+GUNICORN_TIMEOUT: 600
