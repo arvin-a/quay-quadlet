@@ -191,18 +191,11 @@ After=quay-postgres.service
 Requires=quay-postgres.service
 
 [Container]
-Image=docker.io/edoburu/pgbouncer:latest
+Image=quay.io/crunchy-data/crunchy-pgbouncer:latest
 ContainerName=quay-pgbouncer
 Network=host
 Volume=${PGBOUNCER_DIR}:/etc/pgbouncer:Z
-Environment=LISTEN_PORT=${PGBOUNCER_PORT}
-Environment=DB_HOST=127.0.0.1
-Environment=DB_PORT=5432
-Environment=POOL_MODE=transaction
-Environment=MAX_CLIENT_CONN=500
-Environment=DEFAULT_POOL_SIZE=40
-Environment=SERVER_RESET_QUERY=DISCARD ALL
-Environment=AUTH_TYPE=scram-sha-256
+Exec=pgbouncer /etc/pgbouncer/pgbouncer.ini
 
 [Service]
 Restart=always
