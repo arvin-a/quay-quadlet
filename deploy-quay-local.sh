@@ -2,15 +2,12 @@
 
 # Script to deploy Quay container registry on the local machine
 # This script:
-# 1. Deploys quay-postgres, quay-pgbouncer, quay-redis, quay .container files to /etc/containers/systemd/
-# 2. Generates pgbouncer.ini and userlist.txt from DB_URI in config.yaml
-# 3. Rewrites DB_URI in the deployed config.yaml to route through PgBouncer
-# 4. Copies config.yaml to /home/mariam/app-data/quay/config
-# 5. Optionally installs user-provided TLS certificates
-# 6. Creates data, storage, postgres, pgbouncer, and redis dirs
-# 7. Reloads systemd, starts services in order (postgres → pgbouncer → redis → quay), and tests them
+# 1. Deploys quay-postgres, quay-redis, quay .container files to /etc/containers/systemd/
+# 2. Copies config.yaml to /home/mariam/app-data/quay/config
+# 3. Optionally installs user-provided TLS certificates
+# 4. Creates data, storage, postgres, and redis dirs
+# 5. Reloads systemd, starts the services in order, and tests them
 #
-# Connection flow: Quay --> PgBouncer :6432 (transaction pooling) --> PostgreSQL :5432
 # TLS is terminated directly by Quay (ssl.cert + ssl.key in config dir).
 # Pass --cert and --key to install your own certificates during deployment.
 
@@ -183,28 +180,37 @@ sudo cp "$REDIS_CONTAINER_FILE"    "/etc/containers/systemd/$REDIS_CONTAINER_FIL
 sudo cp "$QUAY_CONTAINER_FILE"     "/etc/containers/systemd/$QUAY_CONTAINER_FILE"
 echo "✓ Copied container files to /etc/containers/systemd/"
 
-echo "Generating PgBouncer container unit file..."
-sudo tee "/etc/containers/systemd/$PGBOUNCER_CONTAINER_FILE" > /dev/null <<EOF
+echo "Installing PgBouncer as native RPM (no container image needed)..."
+if ! command -v pgbouncer &>/dev/null; then
+    sudo dnf install -y pgbouncer 2>/dev/null || \
+    sudo yum install -y pgbouncer 2>/dev/null || {
+        echo "✗ ERROR: Could not install pgbouncer via dnf/yum."
+        echo "  On RHEL/CentOS, enable EPEL first: sudo dnf install -y epel-release"
+        exit 1
+    }
+fi
+echo "✓ pgbouncer installed: $(pgbouncer --version 2>/dev/null | head -1 || echo 'version unknown')"
+
+echo "Writing PgBouncer systemd service unit..."
+sudo tee "/etc/systemd/system/quay-pgbouncer.service" > /dev/null <<EOF
 [Unit]
 Description=PgBouncer connection pooler for Quay
 After=quay-postgres.service
 Requires=quay-postgres.service
 
-[Container]
-Image=quay.io/crunchy-data/crunchy-pgbouncer:latest
-ContainerName=quay-pgbouncer
-Network=host
-Volume=${PGBOUNCER_DIR}:/etc/pgbouncer:Z
-Exec=pgbouncer /etc/pgbouncer/pgbouncer.ini
-
 [Service]
+Type=simple
+ExecStart=/usr/bin/pgbouncer ${PGBOUNCER_DIR}/pgbouncer.ini
+ExecReload=/bin/kill -HUP \$MAINPID
 Restart=always
 RestartSec=5
+User=pgbouncer
+Group=pgbouncer
 
 [Install]
-WantedBy=multi-user.target default.target
+WantedBy=multi-user.target
 EOF
-echo "✓ Generated /etc/containers/systemd/$PGBOUNCER_CONTAINER_FILE"
+echo "✓ Written /etc/systemd/system/quay-pgbouncer.service"
 
 echo "Verifying storage Volume= mount in quay.container..."
 INSTALLED_QUAY_UNIT="/etc/containers/systemd/$QUAY_CONTAINER_FILE"
@@ -392,8 +398,7 @@ if command -v getenforce &>/dev/null && [ "$(getenforce)" != "Disabled" ]; then
         # are not blocked from accessing mounts on filesystems without xattr support
         for f in "/etc/containers/systemd/$QUAY_CONTAINER_FILE" \
                  "/etc/containers/systemd/$POSTGRES_CONTAINER_FILE" \
-                 "/etc/containers/systemd/$REDIS_CONTAINER_FILE" \
-                 "/etc/containers/systemd/$PGBOUNCER_CONTAINER_FILE"; do
+                 "/etc/containers/systemd/$REDIS_CONTAINER_FILE"; do
             sudo sed -i 's/:Z\b//g' "$f"
             sudo sed -i '/^\[Container\]/a SecurityLabelDisable=true' "$f"
         done
@@ -456,17 +461,16 @@ else
     exit 1
 fi
 
+echo "Setting PgBouncer config directory ownership..."
+sudo chown -R pgbouncer:pgbouncer "${PGBOUNCER_DIR}" 2>/dev/null || \
+    sudo chmod 755 "${PGBOUNCER_DIR}"
+sudo chmod 600 "${PGBOUNCER_DIR}/userlist.txt" 2>/dev/null || true
+sudo chmod 644 "${PGBOUNCER_DIR}/pgbouncer.ini" 2>/dev/null || true
+
 echo "Starting quay-pgbouncer service..."
 sudo systemctl start quay-pgbouncer.service
-echo "Waiting for PgBouncer to be ready..."
+echo "Waiting for PgBouncer to be ready on port ${PGBOUNCER_PORT}..."
 for i in $(seq 1 12); do
-    if sudo podman exec quay-pgbouncer psql \
-        "postgresql://${DB_USER}:${DB_PASS}@127.0.0.1:${PGBOUNCER_PORT}/${DB_NAME}" \
-        -c "SELECT 1" -q 2>/dev/null | grep -q 1; then
-        echo "✓ PgBouncer is accepting connections (attempt $i)"
-        break
-    fi
-    # Fallback: check the port is open
     if nc -z 127.0.0.1 "${PGBOUNCER_PORT}" 2>/dev/null; then
         echo "✓ PgBouncer port ${PGBOUNCER_PORT} is open (attempt $i)"
         break
@@ -479,7 +483,7 @@ for i in $(seq 1 12); do
     sleep 5
 done
 
-if systemctl is-active --quiet quay-pgbouncer.service; then
+if sudo systemctl is-active --quiet quay-pgbouncer.service; then
     echo "✓ quay-pgbouncer service is running"
 else
     echo "✗ ERROR: quay-pgbouncer service failed to start"
@@ -649,7 +653,8 @@ echo "                 sudo journalctl -u quay-pgbouncer.service -f"
 echo "                 sudo journalctl -u quay-postgres.service -f"
 echo "  Restart all:   sudo systemctl restart quay-postgres.service quay-pgbouncer.service quay-redis.service quay.service"
 echo "  Stop all:      sudo systemctl stop quay.service quay-redis.service quay-pgbouncer.service quay-postgres.service"
-echo "  PgBouncer stats: sudo podman exec quay-pgbouncer psql -p ${PGBOUNCER_PORT} -U ${DB_USER:-quay} pgbouncer -c 'SHOW POOLS;'"
+echo "  PgBouncer stats: psql -h 127.0.0.1 -p ${PGBOUNCER_PORT} -U ${DB_USER:-quay} pgbouncer -c 'SHOW POOLS;'"
+echo "  PgBouncer logs:  sudo journalctl -u quay-pgbouncer.service -f"
 echo "  Config dir:    $CONFIG_DEST_DIR/"
 echo "  Storage dir:   $STORAGE_DIR/"
 echo "  Postgres dir:  $POSTGRES_DIR/"
