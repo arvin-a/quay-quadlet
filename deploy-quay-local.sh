@@ -264,7 +264,7 @@ ${DB_NAME} = host=127.0.0.1 port=5432 dbname=${DB_NAME}
 listen_addr = 127.0.0.1
 listen_port = ${PGBOUNCER_PORT}
 auth_file = /etc/pgbouncer/userlist.txt
-auth_type = scram-sha-256
+auth_type = md5
 pool_mode = transaction
 max_client_conn = 500
 default_pool_size = 40
@@ -461,6 +461,15 @@ else
     exit 1
 fi
 
+echo "Patching PostgreSQL pg_hba.conf to use md5 (required for PgBouncer compatibility)..."
+PG_HBA=$(find "${POSTGRES_DIR}" -name "pg_hba.conf" 2>/dev/null | head -1)
+if [ -n "$PG_HBA" ]; then
+    sudo sed -i 's/scram-sha-256/md5/g' "$PG_HBA"
+    echo "✓ pg_hba.conf updated to use md5 at $PG_HBA"
+else
+    echo "  pg_hba.conf not found yet (will be created on first PostgreSQL start)"
+fi
+
 echo "Setting PgBouncer config directory ownership..."
 sudo chown -R pgbouncer:pgbouncer "${PGBOUNCER_DIR}" 2>/dev/null || \
     sudo chmod 755 "${PGBOUNCER_DIR}"
@@ -490,6 +499,13 @@ else
     sudo journalctl -u quay-pgbouncer.service -n 20 --no-pager
     exit 1
 fi
+
+echo "Resetting DB user password to ensure MD5 storage (required for PgBouncer)..."
+sudo podman exec quay-postgres psql -U quay -d quay \
+    -c "ALTER USER ${DB_USER} WITH PASSWORD '${DB_PASS}';" 2>/dev/null || \
+sudo podman exec quay-postgres psql -U postgres -d quay \
+    -c "ALTER USER ${DB_USER} WITH PASSWORD '${DB_PASS}';" 2>/dev/null || \
+    echo "⚠ Could not reset DB password — run manually if PgBouncer auth fails"
 
 echo "Ensuring required PostgreSQL extensions..."
 sudo podman exec quay-postgres psql -U quay -d quay -c 'CREATE EXTENSION IF NOT EXISTS pg_trgm;' 2>/dev/null || \
