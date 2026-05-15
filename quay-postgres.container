@@ -13,6 +13,8 @@ Volume=/home/mariam/app-data/quay/postgres:/var/lib/pgsql/data:Z
 Environment=POSTGRESQL_USER=quay
 Environment=POSTGRESQL_PASSWORD=test
 Environment=POSTGRESQL_DATABASE=quay
+Environment=POSTGRESQL_MAX_CONNECTIONS=500
+Environment=POSTGRESQL_SHARED_BUFFERS=512MB
 
 [Service]
 Restart=always
