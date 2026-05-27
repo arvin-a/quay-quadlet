@@ -1,26 +1,35 @@
 # OCP + SimplyBlock Baseline Configuration Collector
 
-A shell script that captures a point-in-time snapshot of every meaningful configuration parameter across your OpenShift cluster and SimplyBlock storage nodes. The goal is to give you a deterministic before/after record so that when cluster performance changes — after enabling huge pages, changing CPU count, upgrading firmware, tuning the scheduler, etc. — you know exactly what changed and what the known-good baseline looked like.
+A shell script that captures a point-in-time snapshot of OS/kernel tuning, global OpenShift configuration, and SimplyBlock-related settings across your cluster. The goal is a deterministic before/after record — when performance changes after enabling huge pages, tuning NICs, changing MachineConfig, etc., you know exactly what the known-good baseline looked like.
+
+**Primary deliverable:** `baseline-report.txt` — a single readable file with global OCP settings and per-node sections (kernel, network, storage). Raw files are also kept for precise `diff` comparisons.
+
+---
+
+## Repository files
+
+| File | Purpose |
+|---|---|
+| `collect-baseline.sh` | Main collector — cluster API, node OS via `oc debug`, Prometheus snapshot, report generation |
+| `collect-node-os.sh` | Node-level collector script (runs inside `chroot /host` on each node; invoked automatically) |
 
 ---
 
 ## Why this exists
 
-Modern storage-attached Kubernetes clusters are sensitive to a wide range of settings that live at different layers of the stack:
+Modern storage-attached Kubernetes clusters are sensitive to settings at many layers:
 
 - A kernel parameter (`vm.nr_hugepages`) can double or halve NVMe-oF throughput.
-- Transparent Huge Pages set to `madvise` vs `never` changes latency profiles for database workloads.
+- Transparent Huge Pages set to `madvise` vs `never` changes latency for database workloads.
 - An NIC ring buffer that is too small causes packet drops under storage bursts.
-- A wrong bond `xmit_hash_policy` means only one physical link carries all storage traffic.
-- A `KubeletConfig` or `PerformanceProfile` change silently moves CPU isolation boundaries.
+- A wrong bond `xmit_hash_policy` means only one physical link carries storage traffic.
+- A `KubeletConfig`, `PerformanceProfile`, or `MachineConfig` change silently moves CPU isolation or sysctl boundaries.
 
-Without a baseline, root-cause analysis becomes guesswork. With a baseline, a single `diff` command shows you what changed between two snapshots.
+Without a baseline, root-cause analysis becomes guesswork. With a baseline, `diff` between two labeled snapshots shows what changed.
 
 ---
 
 ## What is collected
-
-The script collects data in five sections.
 
 ### 1. Kernel & OS (per node)
 
@@ -44,13 +53,7 @@ The script collects data in five sections.
 |---|---|
 | All interface addresses and MTU | `ip addr show` |
 | All routing tables | `ip route show table all` |
-| Per-NIC: speed, duplex, driver, firmware | `ethtool`, `ethtool -i` |
-| Per-NIC: offloads (TSO, LRO, GRO, RSS) | `ethtool -k` |
-| Per-NIC: ring buffer sizes | `ethtool -g` |
-| Per-NIC: interrupt coalescing | `ethtool -c` |
-| Per-NIC: channel count | `ethtool -l` |
-| Per-NIC: pause frames | `ethtool -a` |
-| Per-NIC: hardware statistics | `ethtool -S` |
+| Per-NIC: driver, offloads, ring buffers, coalescing, channels | `ethtool`, `ethtool -i/-k/-g/-c/-l/-a/-S` |
 | Bond mode, LACP rate, hash policy, members | `/proc/net/bonding/<bond>` |
 | VLAN IDs and associated interfaces | `/proc/net/vlan/config` |
 | RDMA / RoCE devices and link state | `rdma dev`, `rdma link`, `ibv_devinfo` |
@@ -64,43 +67,29 @@ The script collects data in five sections.
 |---|---|
 | All block devices with scheduler, rotation, sector size, model | `lsblk` |
 | NVMe device list and subsystem topology | `nvme list`, `nvme list-subsys` |
-| I/O scheduler per device | `/sys/block/*/queue/scheduler` |
-| Queue depth, read-ahead, max sectors per device | `/sys/block/*/queue/` params |
-| Multipath device topology | `multipathd -ll` |
-| Multipath configuration file | `/etc/multipath.conf` |
+| I/O scheduler and queue params per device | `/sys/block/*/queue/` |
+| Multipath topology and config | `multipathd -ll`, `/etc/multipath.conf` |
 | Active iSCSI sessions and nodes | `iscsiadm -m session/node` |
 | Mounted filesystems | `/proc/mounts`, `df -hT` |
 
-### 4. OpenShift Cluster (API level)
+### 4. Global OpenShift configuration (cluster API)
 
 | Category | Resources captured |
 |---|---|
 | Cluster identity | `ClusterVersion`, `Infrastructure`, `DNS`, `APIServer`, `Scheduler` |
-| Nodes | `oc get nodes`, `oc describe node` for every node |
-| MachineConfig | All `MachineConfig` objects, all `MachineConfigPool` status |
+| MachineConfig | All `MachineConfig` objects, `MachineConfigPool` status |
 | Performance tuning | `PerformanceProfile`, `KubeletConfig`, `ContainerRuntimeConfig`, NTO `Tuned` + `Profile` |
-| Cluster operators | All `ClusterOperator` status, `Subscription`, `CSV`, `InstallPlan` |
-| Cluster network | `network/cluster`, `NetworkAttachmentDefinition`, SR-IOV policies and node states, `NetworkPolicy` |
-| Storage / CSI | `StorageClass`, `CSIDriver`, `PersistentVolume`, `PersistentVolumeClaim`, `VolumeSnapshot`, `VolumeSnapshotClass` |
+| Cluster network | `network/cluster`, SR-IOV, `NetworkPolicy`, etc. |
+| Storage / CSI | `StorageClass`, `CSIDriver`, PV/PVC, volume snapshots |
 | SimplyBlock | Pods, ConfigMaps, DaemonSets, Deployments, Services in SimplyBlock namespaces |
-| Scheduler / resources | `PriorityClass`, `LimitRange`, `ResourceQuota`, `oc adm top nodes/pods` |
+| Nodes (API) | `oc get/describe nodes` |
+| Cluster operators, events, alerts | For operational context |
 | etcd | Pod list, member list via `etcdctl` |
-| Events and alerts | All cluster events sorted by time, live Prometheus alert list |
+| Scheduler / resources | `PriorityClass`, `LimitRange`, `ResourceQuota`, `oc adm top` |
 
-### 5. Prometheus Metrics Snapshot
+### 5. Prometheus metrics snapshot
 
-A point-in-time query against the in-cluster Prometheus captures quantitative baselines alongside the configuration baselines:
-
-| Metric group | Queries |
-|---|---|
-| CPU | Per-node usage rate, allocatable capacity |
-| Memory | Available, total, huge page free/total, THP fault rate |
-| Network | Per-device rx/tx bytes/s, error rate |
-| Disk | Per-device read/write IOPS, bandwidth, I/O await |
-| etcd | WAL fsync p99 latency, backend commit p99 latency |
-| Containers | Per-pod CPU usage, per-pod memory working set |
-
-Results are saved as JSON files so they can be ingested into any analysis tool.
+Point-in-time queries for CPU, memory, huge pages, network, disk I/O, etcd latency, and container usage — saved as JSON under `prometheus/`.
 
 ---
 
@@ -110,108 +99,169 @@ Results are saved as JSON files so they can be ingested into any analysis tool.
 |---|---|
 | `bash` >= 4.x | Script execution |
 | `oc` CLI | Cluster-level and remote node collection |
-| Active `oc login` session with `cluster-admin` | All OCP API calls |
-| `ethtool`, `nvme-cli`, `numactl` | Node-level collection (usually present on RHCOS) |
-| `python3` | Pretty-printing Prometheus JSON output |
-| `curl` | Prometheus API queries |
+| Active `oc login` session with `cluster-admin` | All OCP API calls and `oc debug node` |
+| `base64` | Passing node collector script into debug pods |
+| `ethtool`, `nvme-cli`, `numactl` | Node-level collection (present on RHCOS) |
+| `python3`, `curl` | Prometheus API queries |
 
-If you are collecting only from a single node as root (`--node-only`), the `oc` CLI is not required.
+For `--node-only`, run as **root** directly on a node; `oc` is not required.
 
 ---
 
 ## Usage
 
 ```bash
-# Full collection — run from a workstation with an active oc session
+# Full collection — workstation with active oc session
 ./collect-baseline.sh
 
-# Tag the snapshot with a meaningful label (strongly recommended)
+# Tag snapshots (strongly recommended for before/after comparison)
 ./collect-baseline.sh --label "pre-hugepages-enable"
 ./collect-baseline.sh --label "post-hugepages-enable"
 
-# Collect only OCP API objects (no node access needed)
+# OCP API + global settings only (no node OS access)
 ./collect-baseline.sh --cluster-only
 
-# Collect only OS-level settings — run as root directly on a node
+# OS-level settings only — run as root on a single node
 sudo ./collect-baseline.sh --node-only
+```
+
+After a full run, open the consolidated report:
+
+```bash
+less baseline_*_<label>/baseline-report.txt
 ```
 
 ---
 
 ## Output layout
 
-Every run creates a timestamped directory and a compressed archive:
+Every run creates a timestamped directory, a compressed archive, and a **single consolidated report**:
 
 ```
-baseline_20260515_133000_pre-hugepages-enable/
-├── MANIFEST.txt                          # list of every file collected + metadata
+baseline_20260526_183401_os-kernel-baseline-v2/
+├── baseline-report.txt                   # ★ main readable output (start here)
+├── MANIFEST.txt                          # inventory of every file collected
 ├── collector.log                         # full run log with warnings
-├── node_<hostname>/                      # present when run as root on a node
-│   ├── kernel_os/
-│   ├── network/
-│   │   └── interfaces/<iface>/
-│   └── storage/
-│       └── queue/<device>/
+├── collect-node-os.sh                    # (source copy lives in repo root)
 ├── cluster/
-│   ├── identity/
-│   ├── nodes/
-│   ├── machineconfig/
-│   ├── performance/
-│   ├── operators/
-│   ├── network/
-│   ├── storage/
+│   ├── identity/                         # cluster version, API server, scheduler
+│   ├── machineconfig/                    # MachineConfig + MCP status
+│   ├── performance/                      # PerformanceProfile, KubeletConfig, TuneD
+│   ├── network/                          # cluster network (MTU, CNI, etc.)
+│   ├── nodes/                            # oc get/describe nodes
+│   ├── nodes_os/<node-name>/             # ★ per-node OS data (via oc debug)
+│   │   ├── collect.log                   # debug/collection log for this node
+│   │   ├── kernel_os/                    # sysctl, hugepages, THP, tuned, cmdline…
+│   │   ├── network/
+│   │   │   └── interfaces/<iface>/       # ethtool, MTU, bonding per NIC
+│   │   └── storage/
+│   │       └── queue/<device>/           # scheduler, queue depth per disk
+│   ├── storage/                          # StorageClasses, PV/PVC, CSI
 │   ├── simplyblock/
+│   ├── operators/
 │   ├── scheduler/
 │   ├── etcd/
 │   ├── events/
-│   └── nodes_os/<node-name>/            # OS data collected via oc debug node
+│   └── ...
+├── node_<hostname>/                      # present when run as root (--node-only)
+│   ├── kernel_os/
+│   ├── network/
+│   └── storage/
 └── prometheus/
     ├── node_cpu_usage.json
-    ├── node_memory_available.json
-    ├── node_disk_read_iops.json
     └── ...
 
-baseline_20260515_133000_pre-hugepages-enable.tar.gz
+baseline_20260526_183401_os-kernel-baseline-v2.tar.gz
+```
+
+### `baseline-report.txt` structure
+
+```
+OCP + SimplyBlock Baseline Report
+  timestamp, label, mode
+
+GLOBAL OCP SETTINGS
+  cluster network, PerformanceProfile, KubeletConfig, TuneD,
+  MachineConfig pools, scheduler, API server
+
+NODE: control1.infra1.k8s.example.com
+  tuning summary (THP, hugepages, TuneD, governor…)
+  Kernel & OS — full file contents
+  Network — full file contents
+  Storage — full file contents
+
+NODE: worker1…
+  …
+
+END OF REPORT
+```
+
+Use **`baseline-report.txt`** for reviews and management. Use the raw files under `cluster/nodes_os/` for precise diffs.
+
+---
+
+## How node OS collection works
+
+When not running as root locally, the script collects from every node via `oc debug`:
+
+1. **Collect on node** — `collect-node-os.sh` is base64-encoded and executed inside `chroot /host`. It writes a tarball to `/var/tmp/ocp-baseline-export.tar.gz` on the node filesystem.
+2. **Fetch tarball** — a separate `oc debug` runs `cat` on that file (clean binary stdout).
+3. **Extract locally** — tarball is unpacked into `cluster/nodes_os/<node>/{kernel_os,network,storage}/`.
+4. **Cleanup** — temp tarball removed from the node.
+
+This two-step fetch is required because `oc debug` merges remote stderr into stdout, which corrupts tarball streams if logs and tar data share the same pipe.
+
+If node collection fails for a specific node, check:
+
+```bash
+cat baseline_*/cluster/nodes_os/<node>/collect.log
 ```
 
 ---
 
 ## Recommended workflow
 
-**1. Capture the baseline before any change**
+**1. Capture baseline before any change**
 
 ```bash
-./collect-baseline.sh --label "before-<change-description>"
+./collect-baseline.sh --label "before-hugepages-enable"
 ```
 
-**2. Make the change** (enable huge pages, update SimplyBlock, tune NIC, etc.)
+**2. Make the change** (huge pages, NIC tuning, MachineConfig, SimplyBlock update, etc.)
 
-**3. Capture the post-change snapshot**
+**3. Capture post-change snapshot**
 
 ```bash
-./collect-baseline.sh --label "after-<change-description>"
+./collect-baseline.sh --label "after-hugepages-enable"
 ```
 
-**4. Compare**
+**4. Review the consolidated reports**
 
 ```bash
-# See which files differ at all
+less baseline_*before-hugepages-enable/baseline-report.txt
+less baseline_*after-hugepages-enable/baseline-report.txt
+```
+
+**5. Diff raw files for exact changes**
+
+```bash
+# See which files differ
 diff -rq \
   baseline_*before-hugepages-enable/ \
   baseline_*after-hugepages-enable/
 
-# Diff a specific config across both snapshots
+# Diff sysctl across nodes
 diff \
-  baseline_*before*/node_*/kernel_os/sysctl_all.txt \
-  baseline_*after*/node_*/kernel_os/sysctl_all.txt
+  baseline_*before*/cluster/nodes_os/worker1*/kernel_os/sysctl_all.txt \
+  baseline_*after*/cluster/nodes_os/worker1*/kernel_os/sysctl_all.txt
 
-# Diff cluster storage classes
+# Diff global TuneD / MachineConfig
 diff \
-  baseline_*before*/cluster/storage/storageclasses.yaml \
-  baseline_*after*/cluster/storage/storageclasses.yaml
+  baseline_*before*/cluster/performance/tuned_profile.yaml \
+  baseline_*after*/cluster/performance/tuned_profile.yaml
 ```
 
-**5. Store in git** — commit each archive or the expanded directory so you have a permanent, diffable history:
+**6. Store in git** (optional)
 
 ```bash
 git add baseline_*.tar.gz
@@ -222,12 +272,38 @@ git commit -m "baseline: post-hugepages-enable $(date +%Y-%m-%d)"
 
 ## What to look for when performance changes
 
-| Symptom | Key files to diff |
+| Symptom | Key files / report sections |
 |---|---|
-| Latency increased after node change | `sysctl_all.txt`, `thp.txt`, `hugepages_*.txt`, `cpufreq.txt` |
-| Throughput dropped | `ethtool_ring_*.txt`, `ethtool_offloads_*.txt`, `bonding.txt`, `disk_scheduler.txt` |
-| Intermittent storage errors | `ethtool_stats_*.txt`, `multipathd_ll.txt`, `iscsiadm_sessions.txt` |
+| Latency increased after node change | `kernel_os/sysctl_all.txt`, `thp.txt`, `hugepages_*.txt`, `cpufreq.txt` |
+| Throughput dropped | `network/interfaces/*/ethtool_ring.txt`, `ethtool_offloads.txt`, `bonding.txt`, `storage/disk_scheduler.txt` |
+| Intermittent storage errors | `ethtool_stats.txt`, `multipathd_ll.txt`, `iscsiadm_sessions.txt` |
+| Global OCP tuning drift | `cluster/performance/`, `cluster/machineconfig/`, report **GLOBAL OCP SETTINGS** section |
 | Pod evictions or OOM | `prometheus/node_memory_*.json`, `cluster/scheduler/resourcequota.yaml` |
 | etcd slow | `prometheus/etcd_*.json`, `cluster/etcd/member_list.txt` |
-| Network packet drops | `prometheus/node_net_errors.json`, `ethtool_stats_*.txt`, `nftables.txt` |
+| Network packet drops | `prometheus/node_net_errors.json`, `ethtool_stats.txt`, `nftables.txt` |
 | CPU steal / noisy-neighbor | `prometheus/node_cpu_usage.json`, `lscpu.txt`, `numactl.txt` |
+
+---
+
+## Troubleshooting
+
+| Problem | What to check |
+|---|---|
+| `nodes_os/` empty or missing `kernel_os/` | `collect.log` per node; verify `oc whoami` and cluster-admin |
+| Node section missing from report | Node OS collection did not succeed — re-run with `--label` after fixing `oc` access |
+| Collection slow | Normal — each node runs three `oc debug` sessions (collect, fetch, cleanup) |
+| `--node-only` on workstation | Must run as **root on the node itself**, not from a laptop |
+
+---
+
+## Salvaging a corrupted tarball (legacy runs)
+
+Older runs that streamed tar directly over `oc debug` may have a `raw_output.bin` with log text prepended to the gzip data. If the tarball starts with `[node] collecting…` text, extract from the gzip magic offset:
+
+```bash
+RAW=baseline_*/cluster/nodes_os/<node>/raw_output.bin
+OFFSET=$(grep -abo $'\x1f\x8b' "$RAW" | head -1 | cut -d: -f1)
+tail -c +$((OFFSET+1)) "$RAW" | tar -xzf - -C baseline_*/cluster/nodes_os/<node>/
+```
+
+Current versions write the tarball to the node filesystem first and do not require this workaround.
